@@ -19,7 +19,9 @@ static __weak UIView *cachedGL;
 static id acDelegate;
 static int tapMode = 1;            // 1 = لمس مباشر، 2 = حدث نظام
 static UILabel *dbgLabel;
-#define PANEL_H (44 + 38 * N + 30)
+#define PANEL_H (44 + 38 * (N + 1) + 30)
+static double holdMs = 80;       // مدة بقاء الزر مضغوطاً
+static UILabel *holdLabel;
 
 #define GREEN [UIColor colorWithRed:0 green:.6 blue:.2 alpha:1]
 
@@ -147,29 +149,33 @@ static BOOL privateOK(void) {
 
 static void setDbg(NSString *t) { dbgLabel.text = t; }
 
-// الطريقة 1: مرّر اللمسة إلى عرض اللعبة نفسه (CCGLView)، وليس إلى
-// نتيجة hitTest؛ لأن عناصر لوحة التويك قد تكون هي العنصر الموجود فوق النقطة.
-// pointInTarget يجب أن تكون بإحداثيات target المحلية.
-static void tapDirect(UIView *target, CGPoint pointInTarget) {
+// الطريقة 1: لمس مباشر على العنصر الموجود تحت النقطة
+static void tapDirect(UIView *target, CGPoint wp) {
+    CGPoint lp = [target convertPoint:wp fromView:nil];
     FakeTouch *t = [FakeTouch new];
-    t.tv = target; t.pt = pointInTarget; t.ph = UITouchPhaseBegan;
+    t.tv = target; t.pt = lp; t.ph = UITouchPhaseBegan;
     t.ts = NSProcessInfo.processInfo.systemUptime;
     NSSet *set = [NSSet setWithObject:t];
     UIApplication *app = UIApplication.sharedApplication;
     UIEvent *ev = nil;
     if ([app respondsToSelector:@selector(_touchesEvent)]) ev = [app _touchesEvent];
-    BOOL isCtl = [target isKindOfClass:UIControl.class];
+    UIControl *ctl = nil;
+    UIView *vv = target;
+    for (int d = 0; vv && d < 4; d++, vv = vv.superview)
+        if ([vv isKindOfClass:UIControl.class]) { ctl = (UIControl *)vv; break; }
+    setDbg([NSString stringWithFormat:@"m1 %@ ctl:%@ hold:%.0f", NSStringFromClass(target.class),
+            ctl ? NSStringFromClass(ctl.class) : @"-", holdMs]);
     @try {
-        if (isCtl) [(UIControl *)target sendActionsForControlEvents:UIControlEventTouchDown];
-        [target touchesBegan:set withEvent:ev];
+        if (ctl) [ctl sendActionsForControlEvents:UIControlEventTouchDown];
+        else [target touchesBegan:set withEvent:ev];
     } @catch (NSException *e) {}
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_MSEC),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(holdMs * NSEC_PER_MSEC)),
                    dispatch_get_main_queue(), ^{
         t.ph = UITouchPhaseEnded;
         t.ts = NSProcessInfo.processInfo.systemUptime;
         @try {
-            [target touchesEnded:set withEvent:ev];
-            if (isCtl) [(UIControl *)target sendActionsForControlEvents:UIControlEventTouchUpInside];
+            if (ctl) [ctl sendActionsForControlEvents:UIControlEventTouchUpInside];
+            else [target touchesEnded:set withEvent:ev];
         } @catch (NSException *e) {}
     });
 }
@@ -187,7 +193,7 @@ static void tapSystem(UIWindow *w, UIView *target, CGPoint wp) {
         [t setWindow:w];
         [t _setIsFirstTouchForView:YES];
         deliver(t, UITouchPhaseBegan, wp);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_MSEC),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(holdMs * NSEC_PER_MSEC)),
                        dispatch_get_main_queue(), ^{
             @try { deliver(t, UITouchPhaseEnded, wp); } @catch (NSException *e) {}
         });
@@ -197,24 +203,13 @@ static void tapSystem(UIWindow *w, UIView *target, CGPoint wp) {
 static void tapAtWindowPoint(CGPoint wp) {
     UIView *gl = glView();
     UIWindow *w = gl.window;
-    if (!gl || !w) { setDbg(@"لا يوجد CCGLView"); return; }
-
-    // wp هي نقطة ضمن إحداثيات النافذة. حوّلها لإحداثيات عرض اللعبة.
-    // لا تستخدم hitTest هنا: قد يعيد panel أو marker بدل عرض Cocos2d.
-    CGPoint glPoint = [gl convertPoint:wp fromView:w];
-    if (!CGRectContainsPoint(gl.bounds, glPoint)) {
-        setDbg(@"النقطة خارج حدود عرض اللعبة");
-        return;
-    }
-
-    setDbg([NSString stringWithFormat:@"m%d  %@  p:%d",
-            tapMode, NSStringFromClass(gl.class), privateOK()]);
-    if (tapMode == 2) {
-        // M2 يعتمد على واجهات UIKit/HID خاصة وغير مضمونة على iOS 26.
-        tapSystem(w, gl, wp);
-    } else {
-        tapDirect(gl, glPoint);
-    }
+    if (!w) { setDbg(@"لا يوجد CCGLView"); return; }
+    UIView *target = [w hitTest:wp withEvent:nil];
+    if (!target || target == w) target = gl;
+    setDbg([NSString stringWithFormat:@"m%d  %@  p:%d", tapMode,
+            NSStringFromClass(target.class), privateOK()]);
+    if (tapMode == 2) tapSystem(w, target, wp);
+    else tapDirect(target, wp);
 }
 
 // ---------- الحلقة المتسلسلة 1 ← 2 ← 3 ← 4 ----------
@@ -227,7 +222,7 @@ static void step(NSUInteger token) {
     UIView *m = markers[i];
     tapAtWindowPoint([m.superview convertPoint:m.center toView:nil]);
     cur = (cur + 1) % N;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayMs[i] * NSEC_PER_MSEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(MAX(delayMs[i], holdMs + 10) * NSEC_PER_MSEC)),
                    dispatch_get_main_queue(), ^{ step(token); });
 }
 
@@ -268,6 +263,11 @@ static void refreshMarkers(void) {
     refreshMarkers();
 }
 + (void)slide:(UISlider *)s {
+    if (s.tag == 100) {
+        holdMs = round(s.value);
+        holdLabel.text = [NSString stringWithFormat:@"%.0fms", holdMs];
+        return;
+    }
     int i = (int)s.tag;
     delayMs[i] = round(s.value);
     labels[i].text = [NSString stringWithFormat:@"%.0fms", delayMs[i]];
@@ -345,7 +345,7 @@ static void buildUI(UIWindow *w) {
     [mb addTarget:ACUI.class action:@selector(mode:) forControlEvents:UIControlEventTouchUpInside];
     [panel addSubview:mb];
 
-    panelBody = [[UIView alloc] initWithFrame:CGRectMake(0, 44, 262, 38 * N + 30)];
+    panelBody = [[UIView alloc] initWithFrame:CGRectMake(0, 44, 262, 38 * (N + 1) + 30)];
     [panel addSubview:panelBody];
 
     for (int i = 0; i < N; i++) {
@@ -368,7 +368,20 @@ static void buildUI(UIWindow *w) {
         l.text = [NSString stringWithFormat:@"%.0fms", delayMs[i]];
         [panelBody addSubview:l]; [labels addObject:l];
     }
-    dbgLabel = [[UILabel alloc] initWithFrame:CGRectMake(8, 38 * N + 4, 246, 20)];
+    CGFloat hy = 38 * N;
+    UILabel *hl = [[UILabel alloc] initWithFrame:CGRectMake(8, hy, 40, 30)];
+    hl.text = @"Hold"; hl.textColor = UIColor.whiteColor; hl.font = [UIFont systemFontOfSize:13];
+    [panelBody addSubview:hl];
+    UISlider *hs = [[UISlider alloc] initWithFrame:CGRectMake(48, hy, 140, 30)];
+    hs.minimumValue = 15; hs.maximumValue = 300; hs.value = holdMs; hs.tag = 100;
+    [hs addTarget:ACUI.class action:@selector(slide:) forControlEvents:UIControlEventValueChanged];
+    [panelBody addSubview:hs];
+    holdLabel = [[UILabel alloc] initWithFrame:CGRectMake(194, hy, 62, 30)];
+    holdLabel.textColor = UIColor.whiteColor; holdLabel.font = [UIFont systemFontOfSize:13];
+    holdLabel.text = [NSString stringWithFormat:@"%.0fms", holdMs];
+    [panelBody addSubview:holdLabel];
+
+    dbgLabel = [[UILabel alloc] initWithFrame:CGRectMake(8, 38 * (N + 1) + 4, 246, 20)];
     dbgLabel.textColor = UIColor.yellowColor;
     dbgLabel.font = [UIFont systemFontOfSize:11];
     dbgLabel.text = @"جاهز";
