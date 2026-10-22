@@ -18,6 +18,9 @@ static int cur = 0;
 static NSUInteger runToken = 0;
 static __weak UIView *cachedGL;
 static id acDelegate;
+static void installHooks(void);
+static void buildModPanel(UIWindow *w);
+static void modSlide(UISlider *s);
 static int tapMode = 1;            // 1 = لمس مباشر، 2 = حدث نظام
 static UILabel *dbgLabel;
 #define PANEL_H (44 + 38 * (N + 1) + 30)
@@ -325,6 +328,7 @@ static void scanGame(void) {
     refreshMarkers();
 }
 + (void)slide:(UISlider *)s {
+    if (s.tag >= 200) { modSlide(s); return; }
     if (s.tag == 100) {
         holdMs = round(s.value);
         holdLabel.text = [NSString stringWithFormat:@"%.0fms", holdMs];
@@ -459,6 +463,297 @@ static void buildUI(UIWindow *w) {
     [panelBody addSubview:dbgLabel];
     [w addSubview:panel];
     refreshMarkers();
+    installHooks();
+    buildModPanel(w);
+}
+
+// ======================= قسم المود: دوال اللعبة نفسها =======================
+@interface NSObject (AC2)
+- (void)onShoot;
+- (void)onSplit;
+@end
+
+static __weak id arenaState;                 // الحالة الحالية للمباراة (تُلتقط من الهوكات)
+static CADisplayLink *macroLink;
+static BOOL macroHeld = NO, softHeld = NO;
+static int macroPF = 3;                      // تغذيات لكل إطار
+static double softMs = 80, splitGap = 30, lastSoft = 0;
+static BOOL zStatic = NO;
+static float zMul = 1.0f, zStaticVal = 1.0f, lastZoom = 1.0f;
+static BOOL fps120 = NO;
+static NSString *fpsInfo = @"";
+static UILabel *modLabel;
+static UIView *modPanel, *modBody;
+static UIButton *staticBtn, *fpsBtn;
+static NSMutableDictionary<NSNumber *, UILabel *> *valLabels;
+
+static BOOL ownsMethod(Class c, SEL sel) {
+    unsigned n = 0;
+    Method *ml = class_copyMethodList(c, &n);
+    BOOL own = NO;
+    for (unsigned i = 0; i < n; i++) if (method_getName(ml[i]) == sel) { own = YES; break; }
+    free(ml);
+    return own;
+}
+
+static void hookVoid(Class c, SEL sel) {
+    if (!c || !ownsMethod(c, sel)) return;
+    IMP orig = method_getImplementation(class_getInstanceMethod(c, sel));
+    method_setImplementation(class_getInstanceMethod(c, sel), imp_implementationWithBlock(^(id me) {
+        arenaState = me;
+        ((void (*)(id, SEL))orig)(me, sel);
+    }));
+}
+static void hookBool(Class c, SEL sel) {
+    if (!c || !ownsMethod(c, sel)) return;
+    IMP orig = method_getImplementation(class_getInstanceMethod(c, sel));
+    method_setImplementation(class_getInstanceMethod(c, sel), imp_implementationWithBlock(^BOOL(id me) {
+        arenaState = me;
+        return ((BOOL (*)(id, SEL))orig)(me, sel);
+    }));
+}
+static void hookPoint(Class c, SEL sel) {
+    if (!c || !ownsMethod(c, sel)) return;
+    IMP orig = method_getImplementation(class_getInstanceMethod(c, sel));
+    method_setImplementation(class_getInstanceMethod(c, sel), imp_implementationWithBlock(^CGPoint(id me) {
+        arenaState = me;
+        return ((CGPoint (*)(id, SEL))orig)(me, sel);
+    }));
+}
+
+static void installHooks(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        for (NSString *nm in @[@"BaseArenaState", @"OnlineArenaState",
+                               @"OfflineModeArenaState", @"BattleRoyaleArenaState"]) {
+            Class c = NSClassFromString(nm);
+            hookVoid(c, @selector(onShoot));
+            hookVoid(c, @selector(onSplit));
+            hookBool(c, NSSelectorFromString(@"canShoot"));
+            hookBool(c, NSSelectorFromString(@"canSplit"));
+        }
+        hookPoint(NSClassFromString(@"BaseArenaState"), NSSelectorFromString(@"massCenter"));
+
+        // الزووم: نعدّل ناتج calculateZoom:cellAmount:
+        Class av = NSClassFromString(@"BaseArenaView");
+        SEL zs = NSSelectorFromString(@"calculateZoom:cellAmount:");
+        if (av && ownsMethod(av, zs)) {
+            IMP orig = method_getImplementation(class_getInstanceMethod(av, zs));
+            method_setImplementation(class_getInstanceMethod(av, zs),
+                imp_implementationWithBlock(^float(id me, float a, int n) {
+                    float r = ((float (*)(id, SEL, float, int))orig)(me, zs, a, n);
+                    float out = zStatic ? zStaticVal : r * zMul;
+                    lastZoom = out;
+                    return out;
+                }));
+        }
+    });
+}
+
+static NSString *applyFPS(BOOL on) {
+    double hz = on ? 120.0 : 60.0;
+    Class dc = NSClassFromString(@"CCDirector");
+    id dir = nil;
+    if (dc && [dc respondsToSelector:NSSelectorFromString(@"sharedDirector")])
+        dir = ((id (*)(id, SEL))objc_msgSend)(dc, NSSelectorFromString(@"sharedDirector"));
+    if (!dir) return @"fps: no director";
+    NSMutableString *r = [NSMutableString stringWithFormat:@"fps→%.0f ", hz];
+    SEL si = NSSelectorFromString(@"setAnimationInterval:");
+    if ([dir respondsToSelector:si]) {
+        ((void (*)(id, SEL, double))objc_msgSend)(dir, si, 1.0 / hz);
+        [r appendString:@"int✓ "];
+    }
+    for (Class c = [dir class]; c; c = class_getSuperclass(c)) {
+        unsigned n = 0;
+        Ivar *iv = class_copyIvarList(c, &n);
+        for (unsigned i = 0; i < n; i++) {
+            const char *t = ivar_getTypeEncoding(iv[i]);
+            if (t && strstr(t, "CADisplayLink")) {
+                id l = object_getIvar(dir, iv[i]);
+                if ([l isKindOfClass:CADisplayLink.class]) {
+                    ((CADisplayLink *)l).preferredFramesPerSecond = (NSInteger)hz;
+                    [r appendString:@"link✓ "];
+                }
+            }
+        }
+        free(iv);
+    }
+    return r;
+}
+
+static void refreshModStatus(void) {
+    id st = arenaState;
+    modLabel.text = [NSString stringWithFormat:@"arena:%@  zoom:%.2f%@\n%@",
+        st ? NSStringFromClass([st class]) : @"none (اضغط زر الفيد الأصلي مرة)",
+        lastZoom, zStatic ? @" S" : @"", fpsInfo];
+}
+
+@interface ACUI (Mod)
++ (void)holdDown:(UIButton *)b;
++ (void)holdUp:(UIButton *)b;
++ (void)splitN:(UIButton *)b;
++ (void)zoomStep:(UIButton *)b;
++ (void)zoomStatic:(UIButton *)b;
++ (void)toggleFPS:(UIButton *)b;
++ (void)collapse2:(UIButton *)b;
++ (void)tick:(CADisplayLink *)l;
+@end
+
+@implementation ACUI (Mod)
++ (void)tick:(CADisplayLink *)l {
+    id st = arenaState;
+    if (!st) return;
+    @try {
+        if (macroHeld) for (int i = 0; i < macroPF; i++) [st onShoot];
+        if (softHeld) {
+            double now = CACurrentMediaTime();
+            if ((now - lastSoft) * 1000.0 >= softMs) { lastSoft = now; [st onShoot]; }
+        }
+    } @catch (NSException *e) {}
+}
++ (void)holdDown:(UIButton *)b {
+    if (b.tag == 0) macroHeld = YES; else softHeld = YES;
+    macroLink.paused = NO;
+    b.alpha = 0.6;
+    refreshModStatus();
+}
++ (void)holdUp:(UIButton *)b {
+    if (b.tag == 0) macroHeld = NO; else softHeld = NO;
+    macroLink.paused = !(macroHeld || softHeld);
+    b.alpha = 1.0;
+}
++ (void)splitN:(UIButton *)b {
+    int n = (int)b.tag;
+    for (int i = 0; i < n; i++)
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * splitGap * NSEC_PER_MSEC)),
+                       dispatch_get_main_queue(), ^{
+            id st = arenaState;
+            if (st) @try { [st onSplit]; } @catch (NSException *e) {}
+        });
+    refreshModStatus();
+}
++ (void)zoomStep:(UIButton *)b {
+    float f = (b.tag == 1) ? 1.1f : (1.0f / 1.1f);
+    if (zStatic) zStaticVal *= f; else zMul *= f;
+    refreshModStatus();
+}
++ (void)zoomStatic:(UIButton *)b {
+    zStatic = !zStatic;
+    if (zStatic) zStaticVal = lastZoom;
+    b.backgroundColor = zStatic ? GREEN : UIColor.grayColor;
+    refreshModStatus();
+}
++ (void)toggleFPS:(UIButton *)b {
+    fps120 = !fps120;
+    fpsInfo = applyFPS(fps120);
+    b.backgroundColor = fps120 ? GREEN : UIColor.grayColor;
+    refreshModStatus();
+}
++ (void)collapse2:(UIButton *)b {
+    BOOL hide = !modBody.hidden;
+    modBody.hidden = hide;
+    CGRect f = modPanel.frame;
+    f.size.height = hide ? 40 : 40 + 316;
+    modPanel.frame = f;
+    [b setTitle:hide ? @"+" : @"–" forState:UIControlStateNormal];
+}
+@end
+
+static void modSlide(UISlider *s) {
+    double v = round(s.value);
+    switch (s.tag) {
+        case 200: macroPF = (int)v; break;
+        case 201: softMs = v; break;
+        case 202: splitGap = v; break;
+    }
+    valLabels[@(s.tag)].text = [NSString stringWithFormat:(s.tag == 200 ? @"%.0f" : @"%.0fms"), v];
+}
+
+static UIButton *mkBtn(UIView *p, NSString *t, CGRect f, UIColor *bg, SEL a, UIControlEvents ev, NSInteger tag) {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.frame = f; b.backgroundColor = bg; b.layer.cornerRadius = 8; b.tag = tag;
+    [b setTitle:t forState:UIControlStateNormal];
+    [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    [b addTarget:ACUI.class action:a forControlEvents:ev];
+    [p addSubview:b];
+    return b;
+}
+
+static void mkSlider(UIView *p, NSString *title, CGFloat y, float mn, float mx, float v, int tag, NSString *fmt) {
+    UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(8, y, 84, 30)];
+    t.text = title; t.textColor = UIColor.whiteColor; t.font = [UIFont systemFontOfSize:12];
+    [p addSubview:t];
+    UISlider *s = [[UISlider alloc] initWithFrame:CGRectMake(94, y, 110, 30)];
+    s.minimumValue = mn; s.maximumValue = mx; s.value = v; s.tag = tag;
+    [s addTarget:ACUI.class action:@selector(slide:) forControlEvents:UIControlEventValueChanged];
+    [p addSubview:s];
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(208, y, 50, 30)];
+    l.textColor = UIColor.whiteColor; l.font = [UIFont systemFontOfSize:12];
+    l.text = [NSString stringWithFormat:fmt, v];
+    [p addSubview:l];
+    valLabels[@(tag)] = l;
+}
+
+static void buildModPanel(UIWindow *w) {
+    valLabels = [NSMutableDictionary new];
+    modPanel = [[UIView alloc] initWithFrame:CGRectMake(290, 60, 262, 40 + 316)];
+    modPanel.backgroundColor = [UIColor colorWithWhite:0 alpha:0.75];
+    modPanel.layer.cornerRadius = 12;
+    UIPanGestureRecognizer *pg = [[UIPanGestureRecognizer alloc] initWithTarget:ACUI.class action:@selector(pan:)];
+    pg.cancelsTouchesInView = NO;
+    pg.delegate = acDelegate;
+    [modPanel addGestureRecognizer:pg];
+
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(12, 4, 120, 30)];
+    title.text = @"MOD"; title.textColor = UIColor.whiteColor;
+    title.font = [UIFont boldSystemFontOfSize:15];
+    [modPanel addSubview:title];
+    mkBtn(modPanel, @"–", CGRectMake(220, 4, 34, 30), UIColor.darkGrayColor,
+          @selector(collapse2:), UIControlEventTouchUpInside, 0);
+
+    modBody = [[UIView alloc] initWithFrame:CGRectMake(0, 40, 262, 316)];
+    [modPanel addSubview:modBody];
+
+    UIControlEvents up = UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel;
+    UIButton *m1 = mkBtn(modBody, @"Macro", CGRectMake(8, 0, 118, 38), UIColor.systemRedColor,
+                         @selector(holdDown:), UIControlEventTouchDown, 0);
+    [m1 addTarget:ACUI.class action:@selector(holdUp:) forControlEvents:up];
+    UIButton *m2 = mkBtn(modBody, @"Soft Macro", CGRectMake(136, 0, 118, 38), UIColor.systemOrangeColor,
+                         @selector(holdDown:), UIControlEventTouchDown, 1);
+    [m2 addTarget:ACUI.class action:@selector(holdUp:) forControlEvents:up];
+
+    mkSlider(modBody, @"Feeds/frame", 44, 1, 10, macroPF, 200, @"%.0f");
+    mkSlider(modBody, @"Soft ms", 78, 30, 300, softMs, 201, @"%.0fms");
+
+    CGFloat x = 8;
+    for (int n = 2; n <= 5; n++, x += 62)
+        mkBtn(modBody, [NSString stringWithFormat:@"%dx", n], CGRectMake(x, 116, 56, 34),
+              UIColor.systemPurpleColor, @selector(splitN:), UIControlEventTouchUpInside, n);
+    mkSlider(modBody, @"Split gap", 154, 10, 200, splitGap, 202, @"%.0fms");
+
+    mkBtn(modBody, @"Zoom −", CGRectMake(8, 192, 70, 34), UIColor.systemBlueColor,
+          @selector(zoomStep:), UIControlEventTouchUpInside, 0);
+    mkBtn(modBody, @"Zoom +", CGRectMake(84, 192, 70, 34), UIColor.systemBlueColor,
+          @selector(zoomStep:), UIControlEventTouchUpInside, 1);
+    staticBtn = mkBtn(modBody, @"Static", CGRectMake(160, 192, 94, 34), UIColor.grayColor,
+                      @selector(zoomStatic:), UIControlEventTouchUpInside, 0);
+
+    fpsBtn = mkBtn(modBody, @"120 FPS", CGRectMake(8, 232, 120, 34), UIColor.grayColor,
+                   @selector(toggleFPS:), UIControlEventTouchUpInside, 0);
+
+    modLabel = [[UILabel alloc] initWithFrame:CGRectMake(8, 272, 246, 40)];
+    modLabel.textColor = UIColor.yellowColor; modLabel.font = [UIFont systemFontOfSize:11];
+    modLabel.numberOfLines = 2;
+    [modBody addSubview:modLabel];
+
+    [w addSubview:modPanel];
+
+    macroLink = [CADisplayLink displayLinkWithTarget:ACUI.class selector:@selector(tick:)];
+    macroLink.paused = YES;
+    [macroLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+
+    [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) { refreshModStatus(); }];
+    refreshModStatus();
 }
 
 // ننتظر حتى يظهر عرض اللعبة (CCGLView) ثم نبني الواجهة
