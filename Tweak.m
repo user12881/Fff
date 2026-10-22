@@ -238,7 +238,16 @@ static void refreshMarkers(void) {
 // ---------- سكانر: يستخرج أسماء دوال وقيم اللعبة ذات العلاقة وينسخها ----------
 static void scanGame(void) {
     NSArray *keys = @[@"shoot", @"split", @"feed", @"zoom", @"scale", @"camera",
-                      @"fps", @"interval", @"eject", @"frame"];
+                      @"fps", @"interval", @"eject", @"cooldown", @"button",
+                      @"touch", @"joystick", @"mass"];
+    NSArray *gameCls = @[@"Arena", @"AgarCell", @"HUD", @"Camera", @"Joystick",
+                         @"MCInput", @"CCDirectorDisplayLink", @"Zoom"];
+    BOOL (^isGame)(const char *) = ^BOOL(const char *n) {
+        NSString *x = [NSString stringWithUTF8String:n];
+        for (NSString *k in gameCls)
+            if ([x rangeOfString:k].location != NSNotFound) return YES;
+        return NO;
+    };
     BOOL (^hit)(const char *) = ^BOOL(const char *n) {
         if (!n) return NO;
         NSString *x = [NSString stringWithUTF8String:n];
@@ -250,16 +259,17 @@ static void scanGame(void) {
     unsigned n = 0;
     Class *list = objc_copyClassList(&n);
     int lines = 0;
-    for (unsigned i = 0; i < n && lines < 700; i++) {
+    for (unsigned i = 0; i < n && lines < 450; i++) {
         Class c = list[i];
         const char *img = class_getImageName(c);
         if (!img || !strstr(img, ".app/") || strstr(img, "/Frameworks/")) continue;  // ملف اللعبة الرئيسي فقط
         const char *cn = class_getName(c);
+        if (!isGame(cn)) continue;
         for (int meta = 0; meta < 2; meta++) {
             Class k = meta ? object_getClass(c) : c;
             unsigned mc = 0;
             Method *ms = class_copyMethodList(k, &mc);
-            for (unsigned j = 0; j < mc && lines < 700; j++) {
+            for (unsigned j = 0; j < mc && lines < 450; j++) {
                 const char *sel = sel_getName(method_getName(ms[j]));
                 if (hit(sel)) {
                     [out appendFormat:@"%c[%s %s] %s\n", meta ? '+' : '-', cn, sel,
@@ -271,7 +281,7 @@ static void scanGame(void) {
         }
         unsigned ic = 0;
         Ivar *iv = class_copyIvarList(c, &ic);
-        for (unsigned j = 0; j < ic && lines < 700; j++) {
+        for (unsigned j = 0; j < ic && lines < 450; j++) {
             const char *nm = ivar_getName(iv[j]);
             if (hit(nm)) {
                 [out appendFormat:@"ivar %s.%s %s\n", cn, nm, ivar_getTypeEncoding(iv[j]) ?: ""];
