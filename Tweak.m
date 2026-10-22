@@ -1,5 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <objc/message.h>
+#import <objc/runtime.h>
 #import <dlfcn.h>
 #import <mach/mach_time.h>
 
@@ -234,6 +235,56 @@ static void refreshMarkers(void) {
     }
 }
 
+// ---------- سكانر: يستخرج أسماء دوال وقيم اللعبة ذات العلاقة وينسخها ----------
+static void scanGame(void) {
+    NSArray *keys = @[@"shoot", @"split", @"feed", @"zoom", @"scale", @"camera",
+                      @"fps", @"interval", @"eject", @"frame"];
+    BOOL (^hit)(const char *) = ^BOOL(const char *n) {
+        if (!n) return NO;
+        NSString *x = [NSString stringWithUTF8String:n];
+        for (NSString *k in keys)
+            if ([x rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+        return NO;
+    };
+    NSMutableString *out = [NSMutableString new];
+    unsigned n = 0;
+    Class *list = objc_copyClassList(&n);
+    int lines = 0;
+    for (unsigned i = 0; i < n && lines < 700; i++) {
+        Class c = list[i];
+        const char *img = class_getImageName(c);
+        if (!img || !strstr(img, ".app/") || strstr(img, "/Frameworks/")) continue;  // ملف اللعبة الرئيسي فقط
+        const char *cn = class_getName(c);
+        for (int meta = 0; meta < 2; meta++) {
+            Class k = meta ? object_getClass(c) : c;
+            unsigned mc = 0;
+            Method *ms = class_copyMethodList(k, &mc);
+            for (unsigned j = 0; j < mc && lines < 700; j++) {
+                const char *sel = sel_getName(method_getName(ms[j]));
+                if (hit(sel)) {
+                    [out appendFormat:@"%c[%s %s] %s\n", meta ? '+' : '-', cn, sel,
+                     method_getTypeEncoding(ms[j]) ?: ""];
+                    lines++;
+                }
+            }
+            free(ms);
+        }
+        unsigned ic = 0;
+        Ivar *iv = class_copyIvarList(c, &ic);
+        for (unsigned j = 0; j < ic && lines < 700; j++) {
+            const char *nm = ivar_getName(iv[j]);
+            if (hit(nm)) {
+                [out appendFormat:@"ivar %s.%s %s\n", cn, nm, ivar_getTypeEncoding(iv[j]) ?: ""];
+                lines++;
+            }
+        }
+        free(iv);
+    }
+    free(list);
+    UIPasteboard.generalPasteboard.string = out;
+    setDbg([NSString stringWithFormat:@"Scan: %d سطر منسوخ للحافظة", lines]);
+}
+
 // ---------- الواجهة ----------
 @interface ACUI : NSObject <UIGestureRecognizerDelegate>
 + (void)start:(UIButton *)b;
@@ -242,6 +293,7 @@ static void refreshMarkers(void) {
 + (void)pan:(UIPanGestureRecognizer *)g;
 + (void)collapse:(UIButton *)b;
 + (void)mode:(UIButton *)b;
++ (void)scan:(UIButton *)b;
 @end
 
 @implementation ACUI
@@ -278,6 +330,7 @@ static void refreshMarkers(void) {
     v.center = CGPointMake(v.center.x + d.x, v.center.y + d.y);
     [g setTranslation:CGPointZero inView:v.superview];
 }
++ (void)scan:(UIButton *)b { scanGame(); }
 + (void)mode:(UIButton *)b {
     tapMode = (tapMode == 1) ? 2 : 1;
     [b setTitle:[NSString stringWithFormat:@"M%d", tapMode] forState:UIControlStateNormal];
@@ -322,7 +375,7 @@ static void buildUI(UIWindow *w) {
     [panel addGestureRecognizer:pg];
 
     startBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    startBtn.frame = CGRectMake(8, 6, 160, 32);
+    startBtn.frame = CGRectMake(8, 6, 118, 32);
     startBtn.backgroundColor = GREEN; startBtn.layer.cornerRadius = 8;
     [startBtn setTitle:@"START" forState:UIControlStateNormal];
     [startBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
@@ -338,12 +391,20 @@ static void buildUI(UIWindow *w) {
     [panel addSubview:cb];
 
     UIButton *mb = [UIButton buttonWithType:UIButtonTypeSystem];
-    mb.frame = CGRectMake(174, 6, 40, 32);
+    mb.frame = CGRectMake(132, 6, 40, 32);
     mb.backgroundColor = UIColor.systemBlueColor; mb.layer.cornerRadius = 8;
     [mb setTitle:@"M1" forState:UIControlStateNormal];
     [mb setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
     [mb addTarget:ACUI.class action:@selector(mode:) forControlEvents:UIControlEventTouchUpInside];
     [panel addSubview:mb];
+
+    UIButton *sb = [UIButton buttonWithType:UIButtonTypeSystem];
+    sb.frame = CGRectMake(178, 6, 36, 32);
+    sb.backgroundColor = UIColor.systemOrangeColor; sb.layer.cornerRadius = 8;
+    [sb setTitle:@"S" forState:UIControlStateNormal];
+    [sb setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    [sb addTarget:ACUI.class action:@selector(scan:) forControlEvents:UIControlEventTouchUpInside];
+    [panel addSubview:sb];
 
     panelBody = [[UIView alloc] initWithFrame:CGRectMake(0, 44, 262, 38 * (N + 1) + 30)];
     [panel addSubview:panelBody];
