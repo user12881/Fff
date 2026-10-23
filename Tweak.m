@@ -19,6 +19,12 @@ static NSUInteger runToken = 0;
 static __weak UIView *cachedGL;
 static id acDelegate;
 static BOOL editBtns = NO;
+static NSMutableDictionary<NSString *, NSValue *> *hookOrig;   // الدوال الأصلية قبل هوكاتنا
+static void recordOrig(Class c, SEL sel, IMP orig) {
+    if (!hookOrig) hookOrig = [NSMutableDictionary new];
+    hookOrig[[NSString stringWithFormat:@"%s %s", class_getName(c), sel_getName(sel)]] =
+        [NSValue valueWithPointer:(const void *)orig];
+}
 static void installHooks(void);
 static void buildModPanel(UIWindow *w);
 static void modSlide(UISlider *s);
@@ -505,6 +511,7 @@ static void hookShoot(Class c) {
     SEL sel = NSSelectorFromString(@"onShoot");
     if (!c || !ownsMethod(c, sel)) return;
     IMP orig = method_getImplementation(class_getInstanceMethod(c, sel));
+    recordOrig(c, sel, orig);
     method_setImplementation(class_getInstanceMethod(c, sel), imp_implementationWithBlock(^(id me) {
         arenaState = me;
         shootDepth++;
@@ -521,6 +528,7 @@ static void hookShoot(Class c) {
 static void hookVoid(Class c, SEL sel) {
     if (!c || !ownsMethod(c, sel)) return;
     IMP orig = method_getImplementation(class_getInstanceMethod(c, sel));
+    recordOrig(c, sel, orig);
     method_setImplementation(class_getInstanceMethod(c, sel), imp_implementationWithBlock(^(id me) {
         arenaState = me;
         ((void (*)(id, SEL))orig)(me, sel);
@@ -529,6 +537,7 @@ static void hookVoid(Class c, SEL sel) {
 static void hookBool(Class c, SEL sel) {
     if (!c || !ownsMethod(c, sel)) return;
     IMP orig = method_getImplementation(class_getInstanceMethod(c, sel));
+    recordOrig(c, sel, orig);
     method_setImplementation(class_getInstanceMethod(c, sel), imp_implementationWithBlock(^BOOL(id me) {
         arenaState = me;
         return ((BOOL (*)(id, SEL))orig)(me, sel);
@@ -578,6 +587,7 @@ static void installHooks(void) {
         SEL us = NSSelectorFromString(@"updateCameraTarget:");
         if (av && ownsMethod(av, us)) {
             IMP orig = method_getImplementation(class_getInstanceMethod(av, us));
+            recordOrig(av, us, orig);
             method_setImplementation(class_getInstanceMethod(av, us),
                 imp_implementationWithBlock(^(id me, float dt) {
                     arenaView = me;
@@ -588,6 +598,7 @@ static void installHooks(void) {
         SEL zs = NSSelectorFromString(@"calculateZoom:cellAmount:");
         if (av && ownsMethod(av, zs)) {
             IMP orig = method_getImplementation(class_getInstanceMethod(av, zs));
+            recordOrig(av, zs, orig);
             method_setImplementation(class_getInstanceMethod(av, zs),
                 imp_implementationWithBlock(^float(id me, float a, int n) {
                     arenaView = me;
@@ -646,7 +657,89 @@ static void refreshModStatus(void) {
         cs ? cs[0] : 0.0f, zBase, zStatic ? zStaticVal : zMul, fpsInfo];
 }
 
+// ---------- تحليل SharkMod: خريطة الهوكات + أصناف المود (بدون البوتات/الحساب) ----------
+static void scanMod(void) {
+    NSArray *skip = @[@"bot", @"token", @"uid", @"account", @"login", @"facebook",
+                      @"fbsdk", @"key", @"password", @"credential", @"discord"];
+    BOOL (^bad)(const char *) = ^BOOL(const char *n) {
+        if (!n) return NO;
+        NSString *x = [NSString stringWithUTF8String:n];
+        for (NSString *k in skip)
+            if ([x rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+        return NO;
+    };
+    NSMutableString *out = [NSMutableString new];
+    int lines = 0;
+    unsigned n = 0;
+    Class *list = objc_copyClassList(&n);
+
+    // 1) دوال استبدلها المود في اللعبة والنظام
+    [out appendString:@"== HOOKED BY SHARKMOD ==\n"];
+    for (unsigned i = 0; i < n && lines < 250; i++) {
+        Class c = list[i];
+        const char *img = class_getImageName(c);
+        if (img && strcasestr(img, "shark")) continue;        // أصناف المود نفسه ليست هوكات
+        const char *cn = class_getName(c);
+        for (int meta = 0; meta < 2; meta++) {
+            Class k = meta ? object_getClass(c) : c;
+            unsigned mc = 0;
+            Method *ms = class_copyMethodList(k, &mc);
+            for (unsigned j = 0; j < mc && lines < 250; j++) {
+                SEL sel = method_getName(ms[j]);
+                IMP imp = method_getImplementation(ms[j]);
+                NSValue *ov = meta ? nil : hookOrig[[NSString stringWithFormat:@"%s %s", cn, sel_getName(sel)]];
+                if (ov) imp = (IMP)[ov pointerValue];          // نتجاوز هوكاتنا لنرى هوك المود
+                Dl_info di;
+                if (dladdr((void *)imp, &di) && di.dli_fname && strcasestr(di.dli_fname, "shark")) {
+                    [out appendFormat:@"%c[%s %s] %s\n", meta ? '+' : '-', cn, sel_getName(sel),
+                     method_getTypeEncoding(ms[j]) ?: ""];
+                    lines++;
+                }
+            }
+            free(ms);
+        }
+    }
+
+    // 2) أصناف المود نفسه
+    [out appendString:@"\n== SHARKMOD CLASSES ==\n"];
+    int total = lines;
+    for (unsigned i = 0; i < n && total < 650; i++) {
+        Class c = list[i];
+        const char *img = class_getImageName(c);
+        if (!img || !strcasestr(img, "shark")) continue;
+        const char *cn = class_getName(c);
+        if (bad(cn)) continue;
+        Class sup = class_getSuperclass(c);
+        [out appendFormat:@"class %s : %s\n", cn, sup ? class_getName(sup) : "-"];
+        total++;
+        for (int meta = 0; meta < 2; meta++) {
+            unsigned mc = 0;
+            Method *ms = class_copyMethodList(meta ? object_getClass(c) : c, &mc);
+            for (unsigned j = 0; j < mc && total < 650; j++) {
+                const char *sel = sel_getName(method_getName(ms[j]));
+                if (bad(sel)) continue;
+                [out appendFormat:@"  %c%s %s\n", meta ? '+' : '-', sel, method_getTypeEncoding(ms[j]) ?: ""];
+                total++;
+            }
+            free(ms);
+        }
+        unsigned ic = 0;
+        Ivar *iv = class_copyIvarList(c, &ic);
+        for (unsigned j = 0; j < ic && total < 650; j++) {
+            const char *nm = ivar_getName(iv[j]);
+            if (bad(nm)) continue;
+            [out appendFormat:@"  ivar %s %s\n", nm, ivar_getTypeEncoding(iv[j]) ?: ""];
+            total++;
+        }
+        free(iv);
+    }
+    free(list);
+    UIPasteboard.generalPasteboard.string = out;
+    modLabel.text = [NSString stringWithFormat:@"SharkMod scan: %d سطر منسوخ للحافظة", total];
+}
+
 @interface ACUI (Mod)
++ (void)scanMod:(UIButton *)b;
 + (void)tick:(CADisplayLink *)l;
 + (void)sw:(UISwitch *)s;
 + (void)fabDown:(UIButton *)b;
@@ -656,6 +749,7 @@ static void refreshModStatus(void) {
 @end
 
 @implementation ACUI (Mod)
++ (void)scanMod:(UIButton *)b { scanMod(); }
 + (void)tick:(CADisplayLink *)l {
     @try {
         if (zoomBtnOn && zoomDir != 0) {
@@ -820,7 +914,7 @@ static void buildModPanel(UIWindow *w) {
     [modPanel addSubview:hdr];
 
     UIScrollView *sc = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 40, 262, bodyH)];
-    sc.contentSize = CGSizeMake(262, 420);
+    sc.contentSize = CGSizeMake(262, 470);
     sc.delaysContentTouches = NO;
     [modPanel addSubview:sc];
 
@@ -840,6 +934,21 @@ static void buildModPanel(UIWindow *w) {
     modLabel.textColor = UIColor.yellowColor; modLabel.font = [UIFont systemFontOfSize:11];
     modLabel.numberOfLines = 3;
     [sc addSubview:modLabel];
+
+    UIButton *b1 = [UIButton buttonWithType:UIButtonTypeSystem];
+    b1.frame = CGRectMake(10, 420, 118, 34);
+    b1.backgroundColor = UIColor.systemOrangeColor; b1.layer.cornerRadius = 8;
+    [b1 setTitle:@"Scan game" forState:UIControlStateNormal];
+    [b1 setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    [b1 addTarget:ACUI.class action:@selector(scan:) forControlEvents:UIControlEventTouchUpInside];
+    [sc addSubview:b1];
+    UIButton *b2 = [UIButton buttonWithType:UIButtonTypeSystem];
+    b2.frame = CGRectMake(136, 420, 118, 34);
+    b2.backgroundColor = UIColor.systemTealColor; b2.layer.cornerRadius = 8;
+    [b2 setTitle:@"Scan SharkMod" forState:UIControlStateNormal];
+    [b2 setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    [b2 addTarget:ACUI.class action:@selector(scanMod:) forControlEvents:UIControlEventTouchUpInside];
+    [sc addSubview:b2];
     [w addSubview:modPanel];
 
     // زر القائمة ☰ (اضغط لإظهار/إخفاء اللوحات، واسحبه لتحريكه)
