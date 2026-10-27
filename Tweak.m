@@ -658,7 +658,7 @@ static void refreshModStatus(void) {
 }
 
 // ---------- تحليل SharkMod: خريطة الهوكات + أصناف المود (بدون البوتات/الحساب) ----------
-static void scanMod(void) {
+static void scanModWork(void) {
     NSArray *skip = @[@"bot", @"token", @"uid", @"account", @"login", @"facebook",
                       @"fbsdk", @"key", @"password", @"credential", @"discord"];
     BOOL (^bad)(const char *) = ^BOOL(const char *n) {
@@ -687,10 +687,18 @@ static void scanMod(void) {
             for (unsigned j = 0; j < mc && lines < 250; j++) {
                 SEL sel = method_getName(ms[j]);
                 IMP imp = method_getImplementation(ms[j]);
-                NSValue *ov = meta ? nil : hookOrig[[NSString stringWithFormat:@"%s %s", cn, sel_getName(sel)]];
-                if (ov) imp = (IMP)[ov pointerValue];          // نتجاوز هوكاتنا لنرى هوك المود
                 Dl_info di;
-                if (dladdr((void *)imp, &di) && di.dli_fname && strcasestr(di.dli_fname, "shark")) {
+                BOOL hit = NO;
+                if (dladdr((void *)imp, &di) && di.dli_fname) {
+                    if (strcasestr(di.dli_fname, "shark")) hit = YES;
+                    else if (!meta && strcasestr(di.dli_fname, "AutoClick")) {   // هوكنا: نفحص الدالة قبل هوكنا
+                        NSValue *ov = hookOrig[[NSString stringWithFormat:@"%s %s", cn, sel_getName(sel)]];
+                        Dl_info d2;
+                        if (ov && dladdr((void *)[ov pointerValue], &d2) && d2.dli_fname &&
+                            strcasestr(d2.dli_fname, "shark")) hit = YES;
+                    }
+                }
+                if (hit) {
                     [out appendFormat:@"%c[%s %s] %s\n", meta ? '+' : '-', cn, sel_getName(sel),
                      method_getTypeEncoding(ms[j]) ?: ""];
                     lines++;
@@ -734,8 +742,17 @@ static void scanMod(void) {
         free(iv);
     }
     free(list);
-    UIPasteboard.generalPasteboard.string = out;
-    modLabel.text = [NSString stringWithFormat:@"SharkMod scan: %d سطر منسوخ للحافظة", total];
+    NSString *res = [out copy];
+    int tcount = total;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIPasteboard.generalPasteboard.string = res;
+        modLabel.text = [NSString stringWithFormat:@"SharkMod scan: %d سطر منسوخ للحافظة", tcount];
+    });
+}
+
+static void scanMod(void) {
+    modLabel.text = @"جاري تحليل SharkMod... انتظر";
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ scanModWork(); });
 }
 
 @interface ACUI (Mod)
