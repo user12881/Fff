@@ -4,21 +4,11 @@
 #import <dlfcn.h>
 #import <mach/mach_time.h>
 
-#define N 4
-
-static BOOL running = NO;
-static BOOL enabled[N] = {YES, YES, NO, NO};
-static double delayMs[N] = {60, 60, 60, 60};
-static UIView *markers[N];
-static UIView *panelBody;
-static UIView *panel;
-static UIButton *startBtn;
-static NSMutableArray<UILabel *> *labels;
-static int cur = 0;
-static NSUInteger runToken = 0;
 static __weak UIView *cachedGL;
 static id acDelegate;
 static BOOL editBtns = NO;
+static double btnSize = 100, btnAlpha = 85;     // حجم وشفافية الأزرار العائمة
+static void saveFabPos(UIView *v);
 static CFTimeInterval msgHold = 0;     // لا يكتب المؤقت فوق رسالة مهمة قبل هذا الوقت
 static NSMutableDictionary<NSString *, NSValue *> *hookOrig;   // الدوال الأصلية قبل هوكاتنا
 static void recordOrig(Class c, SEL sel, IMP orig) {
@@ -29,37 +19,6 @@ static void recordOrig(Class c, SEL sel, IMP orig) {
 static void installHooks(void);
 static void buildModPanel(UIWindow *w);
 static void modSlide(UISlider *s);
-static int tapMode = 1;            // 1 = لمس مباشر، 2 = حدث نظام
-static UILabel *dbgLabel;
-#define PANEL_H (44 + 38 * (N + 1) + 30)
-static double holdMs = 80;       // مدة بقاء الزر مضغوطاً
-static UILabel *holdLabel;
-
-#define GREEN [UIColor colorWithRed:0 green:.6 blue:.2 alpha:1]
-
-// ---------- لمسة مزيفة للطريقة 1 ----------
-@interface FakeTouch : UITouch
-@property (nonatomic) CGPoint pt;
-@property (nonatomic) UITouchPhase ph;
-@property (nonatomic, weak) UIView *tv;
-@property (nonatomic) NSTimeInterval ts;
-@end
-@implementation FakeTouch
-- (UITouchPhase)phase { return self.ph; }
-- (CGPoint)locationInView:(UIView *)v {
-    return v ? [v convertPoint:self.pt fromView:self.tv]
-             : [self.tv convertPoint:self.pt toView:nil];
-}
-- (CGPoint)previousLocationInView:(UIView *)v { return [self locationInView:v]; }
-- (UIView *)view { return self.tv; }
-- (UIWindow *)window { return self.tv.window; }
-- (NSTimeInterval)timestamp { return self.ts; }
-- (NSUInteger)tapCount { return 1; }
-- (UITouchType)type { return UITouchTypeDirect; }
-- (CGFloat)majorRadius { return 5; }
-- (CGFloat)force { return 0; }
-- (NSArray *)gestureRecognizers { return @[]; }
-@end
 
 // ---------- إيجاد عرض Cocos2d ----------
 static UIView *findGL(UIView *v) {
@@ -77,244 +36,10 @@ static UIView *glView(void) {
     return nil;
 }
 
-// ---------- حدث لمس حقيقي عبر UIKit (نفس مسار اللمس الفعلي) ----------
-@interface UITouch (AC)
-- (void)setTapCount:(NSUInteger)c;
-- (void)setIsTap:(BOOL)b;
-- (void)setPhase:(UITouchPhase)p;
-- (void)setTimestamp:(NSTimeInterval)t;
-- (void)setView:(UIView *)v;
-- (void)setWindow:(UIWindow *)w;
-- (void)_setLocationInWindow:(CGPoint)p resetPrevious:(BOOL)r;
-- (void)_setIsFirstTouchForView:(BOOL)b;
-@end
-@interface UIEvent (AC)
-- (void)_clearTouches;
-- (void)_addTouch:(UITouch *)t forDelayedDelivery:(BOOL)d;
-- (void)_setHIDEvent:(void *)e;
-@end
-@interface UIApplication (AC)
-- (UIEvent *)_touchesEvent;
-@end
-
-typedef void *HIDRef;
-
-static HIDRef makeHID(CGPoint loc, UITouchPhase ph) {
-    static HIDRef (*createDig)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t,
-                               uint32_t, double, double, double, double, double, Boolean, Boolean, uint32_t);
-    static HIDRef (*createFinger)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, uint32_t,
-                                  double, double, double, double, double, Boolean, Boolean, uint32_t);
-    static void (*appendEv)(HIDRef, HIDRef);
-    static void (*setInt)(HIDRef, uint32_t, int);
-    static void (*setFloat)(HIDRef, uint32_t, double);
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
-        if (!h) h = RTLD_DEFAULT;
-        createDig = dlsym(h, "IOHIDEventCreateDigitizerEvent");
-        createFinger = dlsym(h, "IOHIDEventCreateDigitizerFingerEvent");
-        appendEv = dlsym(h, "IOHIDEventAppendEvent");
-        setInt = dlsym(h, "IOHIDEventSetIntegerValue");
-        setFloat = dlsym(h, "IOHIDEventSetFloatValue");
-    });
-    if (!createDig || !createFinger || !appendEv) return NULL;
-
-    uint64_t ts = mach_absolute_time();
-    HIDRef hand = createDig(kCFAllocatorDefault, ts, 3, 0, 0, 2, 0, 0, 0, 0, 0, 0, false, false, 0);
-    if (!hand) return NULL;
-    if (setInt) setInt(hand, 0xB0019, 1);                    // IsDisplayIntegrated
-    CGSize sc = UIScreen.mainScreen.bounds.size;
-    uint32_t mask = (ph == UITouchPhaseMoved) ? 4 : (1 | 2);
-    Boolean touching = (ph != UITouchPhaseEnded);
-    HIDRef finger = createFinger(kCFAllocatorDefault, ts, 1, 2, mask,
-                                 loc.x / sc.width, loc.y / sc.height, 0, 0, 0, touching, touching, 0);
-    if (finger) {
-        if (setFloat) { setFloat(finger, 0xB0004, 5.0); setFloat(finger, 0xB0005, 5.0); }
-        appendEv(hand, finger);
-        CFRelease(finger);
-    }
-    return hand;
-}
-
-static void deliver(UITouch *t, UITouchPhase ph, CGPoint wp) {
-    UIApplication *app = UIApplication.sharedApplication;
-    [t setPhase:ph];
-    [t setTimestamp:NSProcessInfo.processInfo.systemUptime];
-    if (ph != UITouchPhaseBegan) [t _setLocationInWindow:wp resetPrevious:NO];
-    UIEvent *ev = [app _touchesEvent];
-    [ev _clearTouches];
-    HIDRef h = makeHID(wp, ph);
-    if (h) { [ev _setHIDEvent:h]; CFRelease(h); }
-    [ev _addTouch:t forDelayedDelivery:NO];
-    [app sendEvent:ev];
-}
-
-static BOOL privateOK(void) {
-    UIApplication *a = UIApplication.sharedApplication;
-    return [a respondsToSelector:@selector(_touchesEvent)]
-        && [UIEvent instancesRespondToSelector:@selector(_clearTouches)]
-        && [UIEvent instancesRespondToSelector:@selector(_addTouch:forDelayedDelivery:)]
-        && [UITouch instancesRespondToSelector:@selector(_setLocationInWindow:resetPrevious:)]
-        && [UITouch instancesRespondToSelector:@selector(setView:)]
-        && [UITouch instancesRespondToSelector:@selector(setPhase:)];
-}
-
-static void setDbg(NSString *t) { dbgLabel.text = t; }
-
-// الطريقة 1: لمس مباشر على العنصر الموجود تحت النقطة
-static void tapDirect(UIView *target, CGPoint wp) {
-    CGPoint lp = [target convertPoint:wp fromView:nil];
-    FakeTouch *t = [FakeTouch new];
-    t.tv = target; t.pt = lp; t.ph = UITouchPhaseBegan;
-    t.ts = NSProcessInfo.processInfo.systemUptime;
-    NSSet *set = [NSSet setWithObject:t];
-    UIApplication *app = UIApplication.sharedApplication;
-    UIEvent *ev = nil;
-    if ([app respondsToSelector:@selector(_touchesEvent)]) ev = [app _touchesEvent];
-    UIControl *ctl = nil;
-    UIView *vv = target;
-    for (int d = 0; vv && d < 4; d++, vv = vv.superview)
-        if ([vv isKindOfClass:UIControl.class]) { ctl = (UIControl *)vv; break; }
-    setDbg([NSString stringWithFormat:@"m1 %@ ctl:%@ hold:%.0f", NSStringFromClass(target.class),
-            ctl ? NSStringFromClass(ctl.class) : @"-", holdMs]);
-    @try {
-        if (ctl) [ctl sendActionsForControlEvents:UIControlEventTouchDown];
-        else [target touchesBegan:set withEvent:ev];
-    } @catch (NSException *e) {}
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(holdMs * NSEC_PER_MSEC)),
-                   dispatch_get_main_queue(), ^{
-        t.ph = UITouchPhaseEnded;
-        t.ts = NSProcessInfo.processInfo.systemUptime;
-        @try {
-            if (ctl) [ctl sendActionsForControlEvents:UIControlEventTouchUpInside];
-            else [target touchesEnded:set withEvent:ev];
-        } @catch (NSException *e) {}
-    });
-}
-
-// الطريقة 2: حدث لمس عبر نظام iOS
-static void tapSystem(UIWindow *w, UIView *target, CGPoint wp) {
-    if (!privateOK()) { setDbg(@"m2: الدوال الخاصة غير متوفرة"); return; }
-    @try {
-        UITouch *t = [[UITouch alloc] init];
-        [t setTapCount:1];
-        [t setIsTap:YES];
-        [t setPhase:UITouchPhaseBegan];
-        [t _setLocationInWindow:wp resetPrevious:YES];
-        [t setView:target];
-        [t setWindow:w];
-        [t _setIsFirstTouchForView:YES];
-        deliver(t, UITouchPhaseBegan, wp);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(holdMs * NSEC_PER_MSEC)),
-                       dispatch_get_main_queue(), ^{
-            @try { deliver(t, UITouchPhaseEnded, wp); } @catch (NSException *e) {}
-        });
-    } @catch (NSException *e) { setDbg([@"m2 exc: " stringByAppendingString:e.name]); }
-}
-
-static void tapAtWindowPoint(CGPoint wp) {
-    UIView *gl = glView();
-    UIWindow *w = gl.window;
-    if (!w) { setDbg(@"لا يوجد CCGLView"); return; }
-    UIView *target = [w hitTest:wp withEvent:nil];
-    if (!target || target == w) target = gl;
-    setDbg([NSString stringWithFormat:@"m%d  %@  p:%d", tapMode,
-            NSStringFromClass(target.class), privateOK()]);
-    if (tapMode == 2) tapSystem(w, target, wp);
-    else tapDirect(target, wp);
-}
-
-// ---------- الحلقة المتسلسلة 1 ← 2 ← 3 ← 4 ----------
-static void step(NSUInteger token) {
-    if (!running || token != runToken) return;
-    int tries = 0;
-    while (!enabled[cur] && tries++ < N) cur = (cur + 1) % N;
-    if (!enabled[cur]) return;
-    int i = cur;
-    UIView *m = markers[i];
-    tapAtWindowPoint([m.superview convertPoint:m.center toView:nil]);
-    cur = (cur + 1) % N;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(MAX(delayMs[i], holdMs + 10) * NSEC_PER_MSEC)),
-                   dispatch_get_main_queue(), ^{ step(token); });
-}
-
-static void refreshMarkers(void) {
-    for (int i = 0; i < N; i++) {
-        markers[i].hidden = !enabled[i];
-        markers[i].userInteractionEnabled = !running;   // أثناء التشغيل لا تبلع اللمسات
-        markers[i].alpha = running ? 0.35 : 1.0;
-    }
-}
-
-// ---------- سكانر: يستخرج أسماء دوال وقيم اللعبة ذات العلاقة وينسخها ----------
-static void scanGame(void) {
-    NSArray *keys = @[@"shoot", @"split", @"feed", @"zoom", @"scale", @"camera",
-                      @"fps", @"interval", @"eject", @"cooldown", @"button",
-                      @"touch", @"joystick", @"mass"];
-    NSArray *gameCls = @[@"Arena", @"AgarCell", @"HUD", @"Camera", @"Joystick",
-                         @"MCInput", @"CCDirectorDisplayLink", @"Zoom"];
-    BOOL (^isGame)(const char *) = ^BOOL(const char *n) {
-        NSString *x = [NSString stringWithUTF8String:n];
-        for (NSString *k in gameCls)
-            if ([x rangeOfString:k].location != NSNotFound) return YES;
-        return NO;
-    };
-    BOOL (^hit)(const char *) = ^BOOL(const char *n) {
-        if (!n) return NO;
-        NSString *x = [NSString stringWithUTF8String:n];
-        for (NSString *k in keys)
-            if ([x rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
-        return NO;
-    };
-    NSMutableString *out = [NSMutableString new];
-    unsigned n = 0;
-    Class *list = objc_copyClassList(&n);
-    int lines = 0;
-    for (unsigned i = 0; i < n && lines < 450; i++) {
-        Class c = list[i];
-        const char *img = class_getImageName(c);
-        if (!img || !strstr(img, ".app/") || strstr(img, "/Frameworks/")) continue;  // ملف اللعبة الرئيسي فقط
-        const char *cn = class_getName(c);
-        if (!isGame(cn)) continue;
-        for (int meta = 0; meta < 2; meta++) {
-            Class k = meta ? object_getClass(c) : c;
-            unsigned mc = 0;
-            Method *ms = class_copyMethodList(k, &mc);
-            for (unsigned j = 0; j < mc && lines < 450; j++) {
-                const char *sel = sel_getName(method_getName(ms[j]));
-                if (hit(sel)) {
-                    [out appendFormat:@"%c[%s %s] %s\n", meta ? '+' : '-', cn, sel,
-                     method_getTypeEncoding(ms[j]) ?: ""];
-                    lines++;
-                }
-            }
-            free(ms);
-        }
-        unsigned ic = 0;
-        Ivar *iv = class_copyIvarList(c, &ic);
-        for (unsigned j = 0; j < ic && lines < 450; j++) {
-            const char *nm = ivar_getName(iv[j]);
-            if (hit(nm)) {
-                [out appendFormat:@"ivar %s.%s %s\n", cn, nm, ivar_getTypeEncoding(iv[j]) ?: ""];
-                lines++;
-            }
-        }
-        free(iv);
-    }
-    free(list);
-    UIPasteboard.generalPasteboard.string = out;
-    setDbg([NSString stringWithFormat:@"Scan: %d سطر منسوخ للحافظة", lines]);
-}
-
 // ---------- الواجهة ----------
-@interface ACUI : NSObject <UIGestureRecognizerDelegate>
-+ (void)start:(UIButton *)b;
-+ (void)toggle:(UIButton *)b;
+@interface ACUI : NSObject <UIGestureRecognizerDelegate, UITextFieldDelegate>
 + (void)slide:(UISlider *)s;
 + (void)pan:(UIPanGestureRecognizer *)g;
-+ (void)collapse:(UIButton *)b;
-+ (void)mode:(UIButton *)b;
-+ (void)scan:(UIButton *)b;
 @end
 
 @implementation ACUI
@@ -322,156 +47,19 @@ static void scanGame(void) {
     if (g.view.tag >= 1000) return editBtns;
     return ![t.view isKindOfClass:UIControl.class];
 }
-+ (void)start:(UIButton *)b {
-    running = !running;
-    runToken++;
-    [b setTitle:running ? @"STOP" : @"START" forState:UIControlStateNormal];
-    b.backgroundColor = running ? UIColor.redColor : GREEN;
-    refreshMarkers();
-    if (running) { cur = 0; step(runToken); }
-}
-+ (void)toggle:(UIButton *)b {
-    int i = (int)b.tag;
-    enabled[i] = !enabled[i];
-    b.backgroundColor = enabled[i] ? GREEN : UIColor.grayColor;
-    refreshMarkers();
-}
-+ (void)slide:(UISlider *)s {
-    if (s.tag >= 200) { modSlide(s); return; }
-    if (s.tag == 100) {
-        holdMs = round(s.value);
-        holdLabel.text = [NSString stringWithFormat:@"%.0fms", holdMs];
-        return;
-    }
-    int i = (int)s.tag;
-    delayMs[i] = round(s.value);
-    labels[i].text = [NSString stringWithFormat:@"%.0fms", delayMs[i]];
-}
+- (BOOL)textFieldShouldReturn:(UITextField *)tf { [tf resignFirstResponder]; return YES; }
++ (void)slide:(UISlider *)s { modSlide(s); }
 + (void)pan:(UIPanGestureRecognizer *)g {
     UIView *v = g.view;
     CGPoint d = [g translationInView:v.superview];
     v.center = CGPointMake(v.center.x + d.x, v.center.y + d.y);
     [g setTranslation:CGPointZero inView:v.superview];
-}
-+ (void)scan:(UIButton *)b { scanGame(); }
-+ (void)mode:(UIButton *)b {
-    tapMode = (tapMode == 1) ? 2 : 1;
-    [b setTitle:[NSString stringWithFormat:@"M%d", tapMode] forState:UIControlStateNormal];
-}
-+ (void)collapse:(UIButton *)b {
-    BOOL hide = !panelBody.hidden;
-    panelBody.hidden = hide;
-    CGRect f = panel.frame;
-    f.size.height = hide ? 44 : PANEL_H;
-    panel.frame = f;
-    [b setTitle:hide ? @"+" : @"–" forState:UIControlStateNormal];
+    if (g.state == UIGestureRecognizerStateEnded && v.tag >= 1000) saveFabPos(v);
 }
 @end
 
 static void buildUI(UIWindow *w) {
-    labels = [NSMutableArray new];
-    UIColor *cols[N] = {UIColor.systemRedColor, UIColor.systemBlueColor,
-                        UIColor.systemOrangeColor, UIColor.systemPurpleColor};
-
-    // دوائر النقر (اسحبها فوق أزرار المود)
-    for (int i = 0; i < N; i++) {
-        UILabel *m = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 44, 44)];
-        m.center = CGPointMake(w.bounds.size.width * (0.3 + 0.15 * i), w.bounds.size.height * 0.7);
-        m.backgroundColor = [cols[i] colorWithAlphaComponent:0.55];
-        m.layer.cornerRadius = 22; m.clipsToBounds = YES;
-        m.textAlignment = NSTextAlignmentCenter; m.textColor = UIColor.whiteColor;
-        m.text = [NSString stringWithFormat:@"%d", i + 1];
-        m.userInteractionEnabled = YES;
-        [m addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:ACUI.class action:@selector(pan:)]];
-        [w addSubview:m];
-        markers[i] = m;
-    }
-
-    // اللوحة
-    panel = [[UIView alloc] initWithFrame:CGRectMake(10, 60, 262, PANEL_H)];
-    panel.backgroundColor = [UIColor colorWithWhite:0 alpha:0.75];
-    panel.layer.cornerRadius = 12;
-    UIPanGestureRecognizer *pg = [[UIPanGestureRecognizer alloc] initWithTarget:ACUI.class action:@selector(pan:)];
-    pg.cancelsTouchesInView = NO;
     acDelegate = [ACUI new];
-    pg.delegate = acDelegate;
-    [panel addGestureRecognizer:pg];
-
-    startBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    startBtn.frame = CGRectMake(8, 6, 118, 32);
-    startBtn.backgroundColor = GREEN; startBtn.layer.cornerRadius = 8;
-    [startBtn setTitle:@"START" forState:UIControlStateNormal];
-    [startBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    [startBtn addTarget:ACUI.class action:@selector(start:) forControlEvents:UIControlEventTouchUpInside];
-    [panel addSubview:startBtn];
-
-    UIButton *cb = [UIButton buttonWithType:UIButtonTypeSystem];
-    cb.frame = CGRectMake(220, 6, 34, 32);
-    cb.backgroundColor = UIColor.darkGrayColor; cb.layer.cornerRadius = 8;
-    [cb setTitle:@"–" forState:UIControlStateNormal];
-    [cb setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    [cb addTarget:ACUI.class action:@selector(collapse:) forControlEvents:UIControlEventTouchUpInside];
-    [panel addSubview:cb];
-
-    UIButton *mb = [UIButton buttonWithType:UIButtonTypeSystem];
-    mb.frame = CGRectMake(132, 6, 40, 32);
-    mb.backgroundColor = UIColor.systemBlueColor; mb.layer.cornerRadius = 8;
-    [mb setTitle:@"M1" forState:UIControlStateNormal];
-    [mb setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    [mb addTarget:ACUI.class action:@selector(mode:) forControlEvents:UIControlEventTouchUpInside];
-    [panel addSubview:mb];
-
-    UIButton *sb = [UIButton buttonWithType:UIButtonTypeSystem];
-    sb.frame = CGRectMake(178, 6, 36, 32);
-    sb.backgroundColor = UIColor.systemOrangeColor; sb.layer.cornerRadius = 8;
-    [sb setTitle:@"S" forState:UIControlStateNormal];
-    [sb setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    [sb addTarget:ACUI.class action:@selector(scan:) forControlEvents:UIControlEventTouchUpInside];
-    [panel addSubview:sb];
-
-    panelBody = [[UIView alloc] initWithFrame:CGRectMake(0, 44, 262, 38 * (N + 1) + 30)];
-    [panel addSubview:panelBody];
-
-    for (int i = 0; i < N; i++) {
-        CGFloat y = 38 * i;
-        UIButton *t = [UIButton buttonWithType:UIButtonTypeSystem];
-        t.frame = CGRectMake(8, y, 34, 30); t.tag = i; t.layer.cornerRadius = 15;
-        t.backgroundColor = enabled[i] ? GREEN : UIColor.grayColor;
-        [t setTitle:[NSString stringWithFormat:@"%d", i + 1] forState:UIControlStateNormal];
-        [t setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-        [t addTarget:ACUI.class action:@selector(toggle:) forControlEvents:UIControlEventTouchUpInside];
-        [panelBody addSubview:t];
-
-        UISlider *s = [[UISlider alloc] initWithFrame:CGRectMake(48, y, 140, 30)];
-        s.minimumValue = 10; s.maximumValue = 500; s.value = delayMs[i]; s.tag = i;
-        [s addTarget:ACUI.class action:@selector(slide:) forControlEvents:UIControlEventValueChanged];
-        [panelBody addSubview:s];
-
-        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(194, y, 62, 30)];
-        l.textColor = UIColor.whiteColor; l.font = [UIFont systemFontOfSize:13];
-        l.text = [NSString stringWithFormat:@"%.0fms", delayMs[i]];
-        [panelBody addSubview:l]; [labels addObject:l];
-    }
-    CGFloat hy = 38 * N;
-    UILabel *hl = [[UILabel alloc] initWithFrame:CGRectMake(8, hy, 40, 30)];
-    hl.text = @"Hold"; hl.textColor = UIColor.whiteColor; hl.font = [UIFont systemFontOfSize:13];
-    [panelBody addSubview:hl];
-    UISlider *hs = [[UISlider alloc] initWithFrame:CGRectMake(48, hy, 140, 30)];
-    hs.minimumValue = 15; hs.maximumValue = 300; hs.value = holdMs; hs.tag = 100;
-    [hs addTarget:ACUI.class action:@selector(slide:) forControlEvents:UIControlEventValueChanged];
-    [panelBody addSubview:hs];
-    holdLabel = [[UILabel alloc] initWithFrame:CGRectMake(194, hy, 62, 30)];
-    holdLabel.textColor = UIColor.whiteColor; holdLabel.font = [UIFont systemFontOfSize:13];
-    holdLabel.text = [NSString stringWithFormat:@"%.0fms", holdMs];
-    [panelBody addSubview:holdLabel];
-
-    dbgLabel = [[UILabel alloc] initWithFrame:CGRectMake(8, 38 * (N + 1) + 4, 246, 20)];
-    dbgLabel.textColor = UIColor.yellowColor;
-    dbgLabel.font = [UIFont systemFontOfSize:11];
-    dbgLabel.text = @"جاهز";
-    [panelBody addSubview:dbgLabel];
-    [w addSubview:panel];
-    refreshMarkers();
     installHooks();
     buildModPanel(w);
 }
@@ -659,6 +247,67 @@ static void refreshModStatus(void) {
         cs ? cs[0] : 0.0f, zBase, zStatic ? zStaticVal : zMul, fpsInfo];
 }
 
+// ---------- سكانر: يستخرج أسماء دوال وقيم اللعبة ذات العلاقة وينسخها ----------
+static void scanGame(void) {
+    NSArray *keys = @[@"shoot", @"split", @"feed", @"zoom", @"scale", @"camera",
+                      @"fps", @"interval", @"eject", @"cooldown", @"button",
+                      @"touch", @"joystick", @"mass"];
+    NSArray *gameCls = @[@"Arena", @"AgarCell", @"HUD", @"Camera", @"Joystick",
+                         @"MCInput", @"CCDirectorDisplayLink", @"Zoom"];
+    BOOL (^isGame)(const char *) = ^BOOL(const char *n) {
+        NSString *x = [NSString stringWithUTF8String:n];
+        for (NSString *k in gameCls)
+            if ([x rangeOfString:k].location != NSNotFound) return YES;
+        return NO;
+    };
+    BOOL (^hit)(const char *) = ^BOOL(const char *n) {
+        if (!n) return NO;
+        NSString *x = [NSString stringWithUTF8String:n];
+        for (NSString *k in keys)
+            if ([x rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+        return NO;
+    };
+    NSMutableString *out = [NSMutableString new];
+    unsigned n = 0;
+    Class *list = objc_copyClassList(&n);
+    int lines = 0;
+    for (unsigned i = 0; i < n && lines < 450; i++) {
+        Class c = list[i];
+        const char *img = class_getImageName(c);
+        if (!img || !strstr(img, ".app/") || strstr(img, "/Frameworks/")) continue;  // ملف اللعبة الرئيسي فقط
+        const char *cn = class_getName(c);
+        if (!isGame(cn)) continue;
+        for (int meta = 0; meta < 2; meta++) {
+            Class k = meta ? object_getClass(c) : c;
+            unsigned mc = 0;
+            Method *ms = class_copyMethodList(k, &mc);
+            for (unsigned j = 0; j < mc && lines < 450; j++) {
+                const char *sel = sel_getName(method_getName(ms[j]));
+                if (hit(sel)) {
+                    [out appendFormat:@"%c[%s %s] %s\n", meta ? '+' : '-', cn, sel,
+                     method_getTypeEncoding(ms[j]) ?: ""];
+                    lines++;
+                }
+            }
+            free(ms);
+        }
+        unsigned ic = 0;
+        Ivar *iv = class_copyIvarList(c, &ic);
+        for (unsigned j = 0; j < ic && lines < 450; j++) {
+            const char *nm = ivar_getName(iv[j]);
+            if (hit(nm)) {
+                [out appendFormat:@"ivar %s.%s %s\n", cn, nm, ivar_getTypeEncoding(iv[j]) ?: ""];
+                lines++;
+            }
+        }
+        free(iv);
+    }
+    free(list);
+    UIPasteboard.generalPasteboard.string = out;
+    msgHold = CACurrentMediaTime() + 15;
+    modLabel.text = [NSString stringWithFormat:@"Scan: %d سطر منسوخ للحافظة", lines];
+}
+
 // ---------- تحليل SharkMod: خريطة الهوكات + أصناف المود (بدون البوتات/الحساب) ----------
 static void scanModWork(void) {
     NSArray *skip = @[@"bot", @"token", @"uid", @"account", @"login", @"facebook",
@@ -762,6 +411,8 @@ static void scanMod(void) {
 
 @interface ACUI (Mod)
 + (void)scanMod:(UIButton *)b;
++ (void)scan:(UIButton *)b;
++ (void)iconChanged:(UITextField *)f;
 + (void)tick:(CADisplayLink *)l;
 + (void)sw:(UISwitch *)s;
 + (void)fabDown:(UIButton *)b;
@@ -772,6 +423,14 @@ static void scanMod(void) {
 
 @implementation ACUI (Mod)
 + (void)scanMod:(UIButton *)b { scanMod(); }
++ (void)scan:(UIButton *)b { scanGame(); }
++ (void)iconChanged:(UITextField *)f {
+    if (!f.text.length) return;
+    NSRange r = [f.text rangeOfComposedCharacterSequenceAtIndex:0];     // أول رمز كامل (إيموجي)
+    NSString *e = [f.text substringWithRange:r];
+    ((UILabel *)menuBtn).text = e;
+    [NSUserDefaults.standardUserDefaults setObject:e forKey:@"ac_icon"];
+}
 + (void)tick:(CADisplayLink *)l {
     @try {
         if (zoomBtnOn && zoomDir != 0) {
@@ -817,23 +476,24 @@ static void scanMod(void) {
             }
             break;
     }
+    if (s.tag != 5 && s.tag != 7)
+        [NSUserDefaults.standardUserDefaults setBool:s.on forKey:[NSString stringWithFormat:@"ac_sw%ld", (long)s.tag]];
     refreshModStatus();
 }
 + (void)fabDown:(UIButton *)b {
     if (editBtns) return;
-    if (b.tag == 1000) { macroHeld = YES; b.alpha = 0.55; }
+    if (b.tag == 1000) { macroHeld = YES; b.alpha = 0.6 * btnAlpha / 100.0; }
     else if (b.tag == 1001) zoomDir = 1;
     else if (b.tag == 1002) zoomDir = -1;
     else if (b.tag >= 1012 && b.tag <= 1015) doSplit((int)b.tag - 1010);
 }
 + (void)fabUp:(UIButton *)b {
-    if (b.tag == 1000) { macroHeld = NO; b.alpha = 1.0; }
+    if (b.tag == 1000) { macroHeld = NO; b.alpha = btnAlpha / 100.0; }
     else if (b.tag == 1001 || b.tag == 1002) zoomDir = 0;
 }
 + (void)menuTap:(UITapGestureRecognizer *)g {
     BOOL show = modPanel.hidden;
     modPanel.hidden = !show;
-    panel.hidden = !show;
 }
 + (void)panParent:(UIPanGestureRecognizer *)g {
     UIView *v = g.view.superview;
@@ -843,6 +503,13 @@ static void scanMod(void) {
 }
 @end
 
+static void applyFabStyle(void) {
+    for (UIButton *b in allFabs) {
+        b.transform = CGAffineTransformMakeScale(btnSize / 100.0, btnSize / 100.0);
+        b.alpha = btnAlpha / 100.0;
+    }
+}
+
 static void modSlide(UISlider *s) {
     double v = round(s.value);
     switch (s.tag) {
@@ -850,7 +517,10 @@ static void modSlide(UISlider *s) {
         case 201: softStrength = v; break;
         case 202: splitSpeed = v; break;
         case 203: zoomSpeed = v; break;
+        case 204: btnSize = v; applyFabStyle(); break;
+        case 205: btnAlpha = v; applyFabStyle(); break;
     }
+    [NSUserDefaults.standardUserDefaults setDouble:v forKey:[NSString stringWithFormat:@"ac_sl%ld", (long)s.tag]];
     valLabels[@(s.tag)].text = [NSString stringWithFormat:@"%.0f", v];
 }
 
@@ -866,12 +536,12 @@ static void mkSwitchRow(UIView *p, NSString *title, CGFloat y, int tag) {
     [p addSubview:sw];
 }
 
-static void mkSlider(UIView *p, NSString *title, CGFloat y, double v, int tag) {
+static void mkSlider(UIView *p, NSString *title, CGFloat y, double mn, double mx, double v, int tag) {
     UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(22, y, 70, 30)];
     t.text = title; t.textColor = [UIColor colorWithWhite:0.8 alpha:1]; t.font = [UIFont systemFontOfSize:12];
     [p addSubview:t];
     UISlider *s = [[UISlider alloc] initWithFrame:CGRectMake(94, y, 120, 30)];
-    s.minimumValue = 0; s.maximumValue = 100; s.value = v; s.tag = tag;
+    s.minimumValue = mn; s.maximumValue = mx; s.value = v; s.tag = tag;
     [s addTarget:ACUI.class action:@selector(slide:) forControlEvents:UIControlEventValueChanged];
     [p addSubview:s];
     UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(218, y, 40, 30)];
@@ -879,6 +549,21 @@ static void mkSlider(UIView *p, NSString *title, CGFloat y, double v, int tag) {
     l.text = [NSString stringWithFormat:@"%.0f", v];
     [p addSubview:l];
     valLabels[@(tag)] = l;
+}
+
+static void saveFabPos(UIView *v) {
+    UIView *p = v.superview;
+    if (!p) return;
+    CGSize sz = p.bounds.size;
+    [NSUserDefaults.standardUserDefaults setObject:@[@(v.center.x / sz.width), @(v.center.y / sz.height)]
+                                            forKey:[NSString stringWithFormat:@"ac_fab%ld", (long)v.tag]];
+}
+static void loadFabPos(UIView *v, UIView *p) {
+    NSArray *a = [NSUserDefaults.standardUserDefaults arrayForKey:[NSString stringWithFormat:@"ac_fab%ld", (long)v.tag]];
+    if (a.count == 2) {
+        CGSize sz = p.bounds.size;
+        v.center = CGPointMake([a[0] doubleValue] * sz.width, [a[1] doubleValue] * sz.height);
+    }
 }
 
 static UIButton *mkFab(UIWindow *w, NSString *t, CGPoint c, UIColor *col, NSInteger tag) {
@@ -900,6 +585,7 @@ static UIButton *mkFab(UIWindow *w, NSString *t, CGPoint c, UIColor *col, NSInte
     [b addGestureRecognizer:pg];
     [w addSubview:b];
     [allFabs addObject:b];
+    loadFabPos(b, w);
     return b;
 }
 
@@ -908,6 +594,13 @@ static void buildModPanel(UIWindow *w) {
     allFabs = [NSMutableArray new];
     fabSplits = [NSMutableArray new];
     CGFloat W = w.bounds.size.width, H = w.bounds.size.height;
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    if ([ud objectForKey:@"ac_sl200"]) macroSpeed = [ud doubleForKey:@"ac_sl200"];
+    if ([ud objectForKey:@"ac_sl201"]) softStrength = [ud doubleForKey:@"ac_sl201"];
+    if ([ud objectForKey:@"ac_sl202"]) splitSpeed = [ud doubleForKey:@"ac_sl202"];
+    if ([ud objectForKey:@"ac_sl203"]) zoomSpeed = [ud doubleForKey:@"ac_sl203"];
+    if ([ud objectForKey:@"ac_sl204"]) btnSize = [ud doubleForKey:@"ac_sl204"];
+    if ([ud objectForKey:@"ac_sl205"]) btnAlpha = [ud doubleForKey:@"ac_sl205"];
 
     // الأزرار العائمة (تظهر عند تفعيل خيارها)
     fabMacro = mkFab(w, @"Macro", CGPointMake(W * 0.86, H * 0.55), UIColor.systemRedColor, 1000);
@@ -922,7 +615,7 @@ static void buildModPanel(UIWindow *w) {
 
     // القائمة
     CGFloat bodyH = MIN(414, H - 150);
-    modPanel = [[UIView alloc] initWithFrame:CGRectMake(290, 60, 262, 40 + bodyH)];
+    modPanel = [[UIView alloc] initWithFrame:CGRectMake(10, 58, 262, 40 + bodyH)];
     modPanel.backgroundColor = [UIColor colorWithWhite:0 alpha:0.78];
     modPanel.layer.cornerRadius = 12;
 
@@ -936,36 +629,49 @@ static void buildModPanel(UIWindow *w) {
     [modPanel addSubview:hdr];
 
     UIScrollView *sc = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 40, 262, bodyH)];
-    sc.contentSize = CGSizeMake(262, 470);
+    sc.contentSize = CGSizeMake(262, 566);
     sc.delaysContentTouches = NO;
     [modPanel addSubview:sc];
 
     mkSwitchRow(sc, @"Macro", 0, 1);
-    mkSlider(sc, @"Speed", 32, macroSpeed, 200);
+    mkSlider(sc, @"Speed", 32, 0, 100, macroSpeed, 200);
     mkSwitchRow(sc, @"Soft Macro (زر اللعبة)", 66, 2);
-    mkSlider(sc, @"Strength", 98, softStrength, 201);
+    mkSlider(sc, @"Strength", 98, 0, 100, softStrength, 201);
     mkSwitchRow(sc, @"Splits", 132, 3);
-    mkSlider(sc, @"Speed", 164, splitSpeed, 202);
+    mkSlider(sc, @"Speed", 164, 0, 100, splitSpeed, 202);
     mkSwitchRow(sc, @"Zoom Buttons", 198, 4);
-    mkSlider(sc, @"Zoom", 230, zoomSpeed, 203);
+    mkSlider(sc, @"Zoom", 230, 0, 100, zoomSpeed, 203);
     mkSwitchRow(sc, @"Static Zoom", 264, 5);
     mkSwitchRow(sc, @"120 FPS", 298, 6);
     mkSwitchRow(sc, @"Move buttons", 332, 7);
+    mkSlider(sc, @"Btn size", 366, 50, 150, btnSize, 204);
+    mkSlider(sc, @"Btn alpha", 398, 20, 100, btnAlpha, 205);
 
-    modLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 368, 244, 44)];
+    UILabel *il = [[UILabel alloc] initWithFrame:CGRectMake(22, 430, 70, 30)];
+    il.text = @"Icon"; il.textColor = [UIColor colorWithWhite:0.8 alpha:1]; il.font = [UIFont systemFontOfSize:12];
+    [sc addSubview:il];
+    UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(94, 430, 120, 30)];
+    tf.text = ([ud stringForKey:@"ac_icon"].length ? [ud stringForKey:@"ac_icon"] : @"💐");
+    tf.textAlignment = NSTextAlignmentCenter; tf.font = [UIFont systemFontOfSize:20];
+    tf.textColor = UIColor.whiteColor; tf.backgroundColor = [UIColor colorWithWhite:1 alpha:0.15];
+    tf.layer.cornerRadius = 6; tf.returnKeyType = UIReturnKeyDone; tf.delegate = acDelegate;
+    [tf addTarget:ACUI.class action:@selector(iconChanged:) forControlEvents:UIControlEventEditingChanged];
+    [sc addSubview:tf];
+
+    modLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 466, 244, 44)];
     modLabel.textColor = UIColor.yellowColor; modLabel.font = [UIFont systemFontOfSize:11];
     modLabel.numberOfLines = 3;
     [sc addSubview:modLabel];
 
     UIButton *b1 = [UIButton buttonWithType:UIButtonTypeSystem];
-    b1.frame = CGRectMake(10, 420, 118, 34);
+    b1.frame = CGRectMake(10, 518, 118, 34);
     b1.backgroundColor = UIColor.systemOrangeColor; b1.layer.cornerRadius = 8;
     [b1 setTitle:@"Scan game" forState:UIControlStateNormal];
     [b1 setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
     [b1 addTarget:ACUI.class action:@selector(scan:) forControlEvents:UIControlEventTouchUpInside];
     [sc addSubview:b1];
     UIButton *b2 = [UIButton buttonWithType:UIButtonTypeSystem];
-    b2.frame = CGRectMake(136, 420, 118, 34);
+    b2.frame = CGRectMake(136, 518, 118, 34);
     b2.backgroundColor = UIColor.systemTealColor; b2.layer.cornerRadius = 8;
     [b2 setTitle:@"Scan SharkMod" forState:UIControlStateNormal];
     [b2 setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
@@ -974,10 +680,12 @@ static void buildModPanel(UIWindow *w) {
     [w addSubview:modPanel];
 
     // زر القائمة ☰ (اضغط لإظهار/إخفاء اللوحات، واسحبه لتحريكه)
-    UILabel *mb = [[UILabel alloc] initWithFrame:CGRectMake(10, 8, 40, 40)];
-    mb.text = @"☰"; mb.textAlignment = NSTextAlignmentCenter; mb.textColor = UIColor.whiteColor;
-    mb.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
-    mb.layer.cornerRadius = 20; mb.clipsToBounds = YES; mb.font = [UIFont systemFontOfSize:20];
+    UILabel *mb = [[UILabel alloc] initWithFrame:CGRectMake(10, 6, 46, 46)];
+    NSString *ic = [ud stringForKey:@"ac_icon"];
+    mb.text = ic.length ? ic : @"💐";
+    mb.textAlignment = NSTextAlignmentCenter;
+    mb.backgroundColor = [UIColor colorWithWhite:0 alpha:0.18];
+    mb.layer.cornerRadius = 23; mb.clipsToBounds = YES; mb.font = [UIFont systemFontOfSize:28];
     mb.userInteractionEnabled = YES;
     [mb addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:ACUI.class action:@selector(menuTap:)]];
     UIPanGestureRecognizer *mp = [[UIPanGestureRecognizer alloc] initWithTarget:ACUI.class action:@selector(pan:)];
@@ -985,6 +693,17 @@ static void buildModPanel(UIWindow *w) {
     [mb addGestureRecognizer:mp];
     [w addSubview:mb];
     menuBtn = mb;
+
+    // استرجاع المفاتيح المحفوظة (Static Zoom وMove buttons لا تُحفظ)
+    for (NSNumber *t in @[@1, @2, @3, @4, @6]) {
+        if (![ud boolForKey:[NSString stringWithFormat:@"ac_sw%d", t.intValue]]) continue;
+        UISwitch *sw = (UISwitch *)[sc viewWithTag:t.intValue];
+        if ([sw isKindOfClass:UISwitch.class]) { sw.on = YES; [ACUI sw:sw]; }
+    }
+    applyFabStyle();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        if (fps120) fpsInfo = applyFPS(YES);      // اللعبة قد تعيد ضبط المؤقت بعد البدء
+    });
 
     frameLink = [CADisplayLink displayLinkWithTarget:ACUI.class selector:@selector(tick:)];
     [frameLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
