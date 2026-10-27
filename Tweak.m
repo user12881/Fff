@@ -719,6 +719,7 @@ static void scanModWork(void) {
         if (!img || !strcasestr(img, "shark")) continue;
         const char *cn = class_getName(c);
         if (bad(cn)) continue;
+        if (!strncmp(cn, "GPB", 3) || strstr(cn, "Protobuf")) continue;   // مكتبة Protobuf: ضجيج
         Class sup = class_getSuperclass(c);
         [out appendFormat:@"class %s : %s\n", cn, sup ? class_getName(sup) : "-"];
         total++;
