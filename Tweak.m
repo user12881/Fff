@@ -19,6 +19,7 @@ static NSUInteger runToken = 0;
 static __weak UIView *cachedGL;
 static id acDelegate;
 static BOOL editBtns = NO;
+static CFTimeInterval msgHold = 0;     // لا يكتب المؤقت فوق رسالة مهمة قبل هذا الوقت
 static NSMutableDictionary<NSString *, NSValue *> *hookOrig;   // الدوال الأصلية قبل هوكاتنا
 static void recordOrig(Class c, SEL sel, IMP orig) {
     if (!hookOrig) hookOrig = [NSMutableDictionary new];
@@ -650,6 +651,7 @@ static void doSplit(int n) {
 }
 
 static void refreshModStatus(void) {
+    if (CACurrentMediaTime() < msgHold) return;
     id st = arenaState, v = arenaView;
     float *cs = camScale(v);
     modLabel.text = [NSString stringWithFormat:@"arena:%@ view:%@\ncam:%.3f base:%.3f z:%.2f %@",
@@ -746,11 +748,13 @@ static void scanModWork(void) {
     int tcount = total;
     dispatch_async(dispatch_get_main_queue(), ^{
         UIPasteboard.generalPasteboard.string = res;
+        msgHold = CACurrentMediaTime() + 15;
         modLabel.text = [NSString stringWithFormat:@"SharkMod scan: %d سطر منسوخ للحافظة", tcount];
     });
 }
 
 static void scanMod(void) {
+    msgHold = CACurrentMediaTime() + 300;
     modLabel.text = @"جاري تحليل SharkMod... انتظر";
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ scanModWork(); });
 }
@@ -942,7 +946,7 @@ static void buildModPanel(UIWindow *w) {
     mkSwitchRow(sc, @"Splits", 132, 3);
     mkSlider(sc, @"Speed", 164, splitSpeed, 202);
     mkSwitchRow(sc, @"Zoom Buttons", 198, 4);
-    mkSlider(sc, @"Zoom speed", 230, zoomSpeed, 203);
+    mkSlider(sc, @"Zoom", 230, zoomSpeed, 203);
     mkSwitchRow(sc, @"Static Zoom", 264, 5);
     mkSwitchRow(sc, @"120 FPS", 298, 6);
     mkSwitchRow(sc, @"Move buttons", 332, 7);
